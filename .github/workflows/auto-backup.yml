@@ -1,0 +1,182 @@
+name: Auto Database Backup
+
+on:
+  schedule:
+    # Run daily at 00:00 UTC
+    - cron: '0 0 * * *'
+  workflow_dispatch: # Allow manual trigger
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Set up PostgreSQL 17 client
+        run: |
+          echo "=== Installing PostgreSQL 17 Client ==="
+
+          # Add PostgreSQL APT repository for version 17
+          echo "Adding PostgreSQL APT repository..."
+          sudo apt-get update
+          sudo apt-get install -y wget gnupg
+          sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+          wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
+          sudo apt-get update
+
+          # Install PostgreSQL 17 client
+          echo "Installing PostgreSQL 17 client tools..."
+          sudo apt-get install -y postgresql-client-17
+
+          # Set PostgreSQL 17 as default using update-alternatives
+          echo "Setting PostgreSQL 17 as default version..."
+          sudo update-alternatives --install /usr/bin/pg_dump pg_dump /usr/lib/postgresql/17/bin/pg_dump 100
+          sudo update-alternatives --install /usr/bin/psql psql /usr/lib/postgresql/17/bin/psql 100
+
+          # Verify version
+          echo "Installed versions:"
+          pg_dump --version
+          psql --version
+          echo "=== PostgreSQL Client Setup Complete ==="
+
+      - name: Set backup filename with date
+        id: backup-info
+        run: |
+          echo "=== Generating Backup Filename ==="
+          BACKUP_DATE=$(TZ='Asia/Taipei' date +'%Y-%m-%d')
+          BACKUP_FILE="backup_${BACKUP_DATE}.sql"
+          echo "backup_date=${BACKUP_DATE}" >> $GITHUB_OUTPUT
+          echo "backup_file=${BACKUP_FILE}" >> $GITHUB_OUTPUT
+          echo "Date: ${BACKUP_DATE}"
+          echo "Filename: ${BACKUP_FILE}"
+          echo "Timezone: Asia/Taipei (UTC+8)"
+
+      - name: Setup SSL certificate for Supabase
+        env:
+          SUPABASE_SSL_CERT_BASE64: ${{ secrets.SUPABASE_SSL_CERT_BASE64 }}
+        run: |
+          echo "=== Setting Up Supabase SSL Certificate ==="
+          mkdir -p ~/.postgresql
+          echo "Decoding base64 certificate..."
+          echo "${SUPABASE_SSL_CERT_BASE64}" | base64 -d > ~/.postgresql/root.crt
+          chmod 600 ~/.postgresql/root.crt
+          echo "Certificate installed at: ~/.postgresql/root.crt"
+          echo "Certificate permissions: 600"
+          echo "Certificate size: $(wc -c < ~/.postgresql/root.crt) bytes"
+          echo "=== SSL Certificate Setup Complete ==="
+
+      - name: Dump database from Supabase
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          PGSSLROOTCERT: /home/runner/.postgresql/root.crt
+          PGSSLMODE: verify-ca
+        run: |
+          echo "=== Exporting Database from Supabase ==="
+          echo "SSL Mode: verify-ca"
+          echo "SSL Certificate: ${PGSSLROOTCERT}"
+          echo "Starting pg_dump..."
+
+          START_TIME=$(date +%s)
+          pg_dump "${SUPABASE_DB_URL}" \
+            --no-owner \
+            --no-acl \
+            --clean \
+            --if-exists \
+            -f "backups/${{ steps.backup-info.outputs.backup_file }}"
+          END_TIME=$(date +%s)
+          DURATION=$((END_TIME - START_TIME))
+
+          echo "Dump completed in ${DURATION} seconds"
+          echo "Backup file: backups/${{ steps.backup-info.outputs.backup_file }}"
+          echo "File size: $(du -h "backups/${{ steps.backup-info.outputs.backup_file }}" | cut -f1)"
+          ls -lh "backups/${{ steps.backup-info.outputs.backup_file }}"
+          echo "=== Database Export Complete ==="
+
+      - name: Restore database to Neon
+        env:
+          NEON_DB_URL: ${{ secrets.NEON_DB_URL }}
+          PGSSLROOTCERT: /etc/ssl/certs/ca-certificates.crt
+          PGSSLMODE: verify-full
+        run: |
+          echo "=== Restoring Database to Neon ==="
+          echo "SSL Mode: verify-full"
+          echo "SSL Certificate: ${PGSSLROOTCERT} (system root certificate)"
+          echo "Starting psql restore..."
+
+          START_TIME=$(date +%s)
+          psql "${NEON_DB_URL}" -f "backups/${{ steps.backup-info.outputs.backup_file }}"
+          END_TIME=$(date +%s)
+          DURATION=$((END_TIME - START_TIME))
+
+          echo "Restore completed in ${DURATION} seconds"
+          echo "=== Database Restore Complete ==="
+
+      - name: Cleanup old backups (keep last N snapshots)
+        env:
+          RETENTION_COUNT: ${{ secrets.BACKUP_RETENTION_COUNT || '7' }}
+        run: |
+          echo "=== Cleaning Up Old Backup Snapshots ==="
+          echo "Retention policy: Keep last ${RETENTION_COUNT} snapshots"
+
+          cd backups
+          TOTAL_BACKUPS=$(ls -1 backup_*.sql 2>/dev/null | wc -l)
+          echo "Total backup files found: ${TOTAL_BACKUPS}"
+
+          # Calculate the line number to start deleting from (RETENTION_COUNT + 1)
+          DELETE_FROM=$((RETENTION_COUNT + 1))
+
+          # Keep only the N most recent backup files
+          if [ ${TOTAL_BACKUPS} -gt ${RETENTION_COUNT} ]; then
+            echo "Removing old backups (keeping ${RETENTION_COUNT} most recent)..."
+            ls -t backup_*.sql | tail -n +${DELETE_FROM} | xargs -r rm -v
+          else
+            echo "No cleanup needed (total backups <= retention count)"
+          fi
+
+          echo ""
+          echo "Remaining backup snapshots:"
+          ls -lht backup_*.sql 2>/dev/null || echo "No backup files found"
+          echo "=== Cleanup Complete ==="
+
+      - name: Commit backup file
+        run: |
+          echo "=== Committing Backup Snapshot to Repository ==="
+
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+
+          git add backups/
+
+          echo "Checking for changes..."
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            echo "Changes detected, creating commit..."
+            git commit -m "chore: create snapshot ${{ steps.backup-info.outputs.backup_date }}"
+
+            echo "Pushing to remote repository..."
+            git push
+
+            echo "Snapshot committed and pushed successfully"
+            echo "Commit date: ${{ steps.backup-info.outputs.backup_date }}"
+          fi
+          echo "=== Commit Complete ==="
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "::error::=== Database Backup Workflow Failed ==="
+          echo "::error::Backup date: ${{ steps.backup-info.outputs.backup_date }}"
+          echo "::error::Please check the workflow logs above for detailed error messages."
+          echo "::error::Common issues:"
+          echo "::error::  - Invalid database connection strings"
+          echo "::error::  - Missing or incorrect SSL certificates"
+          echo "::error::  - Insufficient database permissions"
+          echo "::error::  - Network connectivity issues"

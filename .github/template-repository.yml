@@ -1,0 +1,17 @@
+# Template Repository Configuration
+# This file helps users understand what to customize when using this template
+
+# Files that should be customized by users
+files_to_customize:
+  - README.md  # Update badge URLs with your repository information
+  - .env.example  # Reference for setting up GitHub Secrets
+
+# GitHub Secrets that must be configured
+required_secrets:
+  - SUPABASE_DB_URL
+  - SUPABASE_SSL_CERT_BASE64
+  - NEON_DB_URL
+
+# Actions that need to be enabled
+workflows:
+  - .github/workflows/auto-backup.yml
